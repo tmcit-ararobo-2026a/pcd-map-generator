@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 test_output/
 output/
+output_*/
 *.pcd
 *.pgm
 *.png

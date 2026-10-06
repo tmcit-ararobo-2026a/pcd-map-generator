@@ -9,6 +9,7 @@ PCD インタラクティブ領域抽出 & 2D マップ / JSON 生成ツール
 import argparse
 import os
 import sys
+import cv2
 import numpy as np
 
 from pcd_map_generator import (
@@ -16,8 +17,11 @@ from pcd_map_generator import (
     detect_floor_elevation_z,
     generate_topdown_preview_image,
     select_region_of_interest,
+    select_obstacles_interactively,
     crop_and_save_point_cloud,
-    extract_field_objects_and_create_maps,
+    build_field_map_data,
+    create_occupancy_grid_and_meta,
+    draw_objects_on_preview,
     save_ros_nav2_map,
     save_field_json_map,
     save_preview_image,
@@ -66,6 +70,11 @@ def parse_arguments() -> argparse.Namespace:
         help="外周壁の自動生成を無効化する場合"
     )
     parser.add_argument(
+        "--add_obstacles",
+        action="store_true",
+        help="GUI で机やバケツなどの障害物を手動追加するモード"
+    )
+    parser.add_argument(
         "--bbox",
         type=float,
         nargs=4,
@@ -103,7 +112,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         resolution_m=args.resolution_m
     )
 
-    # 4. 領域選択 (GUI マウスドラッグ または CLI 引数)
+    # 4. フィールド領域選択 (GUI マウスドラッグ または CLI 引数)
     bbox_override = args.bbox if (args.bbox or args.headless) else None
     if args.headless and bbox_override is None:
         bbox_override = [meta.min_x_m, meta.max_x_m, meta.min_y_m, meta.max_y_m]
@@ -119,29 +128,57 @@ def run_pipeline(args: argparse.Namespace) -> None:
         robot_height_m=args.robot_height_m,
         output_pcd_path=output_pcd_path
     )
-
-    # 6. オブジェクト抽出 & 2D マップ生成
     cropped_points = np.asarray(cropped_cloud.points)
-    field_objects, obstacle_grid, preview_image, local_meta = extract_field_objects_and_create_maps(
+
+    # 6. クロップ領域の 2D 占有グリッドを作成
+    closed_obstacle_grid, local_meta, _ = create_occupancy_grid_and_meta(
+        cropped_points=cropped_points,
+        bbox=selected_bbox,
+        floor_z_m=floor_z_m,
+        ground_margin_m=args.ground_margin_m,
+        robot_height_m=args.robot_height_m,
+        resolution_m=args.resolution_m
+    )
+
+    # 7. 手動障害物追加 (GUI モードかつユーザーが希望した場合)
+    additional_objects = []
+    if not args.headless:
+        prompt_add = args.add_obstacles
+        if not prompt_add:
+            user_choice = input("\nフィールド内部の障害物 (机・バケツ等) を GUI で追加しますか？ [y/N]: ").strip().lower()
+            prompt_add = user_choice in ["y", "yes"]
+
+        if prompt_add:
+            base_preview_bgr = cv2.cvtColor(closed_obstacle_grid, cv2.COLOR_GRAY2BGR)
+            additional_objects = select_obstacles_interactively(
+                cropped_points=cropped_points,
+                local_meta=local_meta,
+                floor_z_m=floor_z_m,
+                base_preview_image=base_preview_bgr
+            )
+
+    # 8. フィールド定義オブジェクト (外壁 + 追加障害物) およびプレビュー生成
+    field_objects, _, preview_image, _ = build_field_map_data(
         cropped_points=cropped_points,
         bbox=selected_bbox,
         floor_z_m=floor_z_m,
         ground_margin_m=args.ground_margin_m,
         robot_height_m=args.robot_height_m,
         resolution_m=args.resolution_m,
-        generate_outer_walls=(not args.no_outer_walls)
+        generate_outer_walls_flag=(not args.no_outer_walls),
+        additional_objects=additional_objects
     )
 
-    # 7. ROS 2 Nav2 標準マップ (PGM + YAML) 保存
+    # 9. ROS 2 Nav2 標準マップ (PGM + YAML) 保存
     output_pgm_path = os.path.join(args.output_dir, f"{args.prefix}_map.pgm")
     output_yaml_path = os.path.join(args.output_dir, f"{args.prefix}_map.yaml")
-    save_ros_nav2_map(obstacle_grid, local_meta, output_pgm_path, output_yaml_path)
+    save_ros_nav2_map(closed_obstacle_grid, local_meta, output_pgm_path, output_yaml_path)
 
-    # 8. 人間確認用プレビュー画像 (PNG) 保存
+    # 10. 人間確認用プレビュー画像 (PNG) 保存
     output_preview_png = os.path.join(args.output_dir, f"{args.prefix}_preview.png")
     save_preview_image(preview_image, output_preview_png)
 
-    # 9. gn10-pointcloud-localization 互換 JSON 保存
+    # 11. gn10-pointcloud-localization 互換 JSON 保存
     output_json_path = os.path.join(args.output_dir, f"{args.prefix}_map.json")
     save_field_json_map(field_objects, output_json_path)
 

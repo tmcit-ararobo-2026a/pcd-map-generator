@@ -1,8 +1,8 @@
 """
-クロップ点群からの 2D グリッドマップ生成および幾何オブジェクト (外壁/机/バケツ) 抽出モジュール
+クロップ点群からの 2D グリッドマップ生成およびフィールド幾何オブジェクト (外壁/指定障害物) 生成モジュール
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -10,37 +10,68 @@ import numpy as np
 from pcd_map_generator.coordinates import BoundingBox2D, CoordinateTransformMeta
 
 
-def _generate_outer_walls(
+def generate_outer_walls(
     bbox: BoundingBox2D,
     wall_thickness_m: float = 0.024,
-    wall_height_max_m: float = 0.150
+    wall_height_max_m: float = 0.150,
+    include_visual_foot: bool = True
 ) -> List[Dict[str, Any]]:
-    """選択領域の外周四方を囲む立上りフェンス (外壁) オブジェクト定義を生成
+    """選択領域の外周四方を囲む立上りフェンス (および土台) オブジェクト定義を生成
+
+    高専ロボコン/NHK学生ロボコンの CAD 規格（150mm L字断面・木材厚24mm）に準拠:
+    - 立上り部 (BOX): LiDAR 点群と照合される 24mm 厚の木材 (Z: 0.024m 〜 0.150m)
+    - 土台部 (VISUAL_BOX): 床面に置かれる 150mm 幅の土台 (Z: 0.000m 〜 0.024m, 地面除去で消えるため照合外)
 
     Args:
-        bbox: 選択バウンディングボックス
-        wall_thickness_m: 壁の厚み [m] (デフォルト: 24mm)
+        bbox: 選択バウンディングボックス (競技エリアの内寸境界)
+        wall_thickness_m: 立上り木材の厚み [m] (デフォルト: 24mm)
         wall_height_max_m: 立上りフェンスの高さ上限 [m] (デフォルト: 150mm)
+        include_visual_foot: 表示専用の土台 (VISUAL_BOX) を含めるか
 
     Returns:
-        List[Dict[str, Any]]: gn10-pointcloud-localization 形式の外壁辞書リスト
+        List[Dict[str, Any]]: gn10-pointcloud-localization 形式の外壁定義リスト
     """
     center_x = (bbox.min_x_m + bbox.max_x_m) / 2.0
     center_y = (bbox.min_y_m + bbox.max_y_m) / 2.0
     half_x = (bbox.max_x_m - bbox.min_x_m) / 2.0
     half_y = (bbox.max_y_m - bbox.min_y_m) / 2.0
 
-    outer_walls = [
-        ("外壁 (上) 立上り", center_x, bbox.max_y_m, half_x, wall_thickness_m / 2.0),
-        ("外壁 (下) 立上り", center_x, bbox.min_y_m, half_x, wall_thickness_m / 2.0),
-        ("外壁 (左) 立上り", bbox.min_x_m, center_y, wall_thickness_m / 2.0, half_y),
-        ("外壁 (右) 立上り", bbox.max_x_m, center_y, wall_thickness_m / 2.0, half_y),
-    ]
+    half_thickness = wall_thickness_m / 2.0
+    foot_width_m = 0.150
+    half_foot_width = foot_width_m / 2.0
 
-    wall_objects = []
-    for wall_name, wx, wy, p1, p2 in outer_walls:
+    wall_objects: List[Dict[str, Any]] = []
+
+    # 1. 表示用 土台 (VISUAL_BOX)
+    if include_visual_foot:
+        visual_foots = [
+            ("外壁 (上) 土台", center_x, bbox.max_y_m + half_foot_width, half_x, half_foot_width),
+            ("外壁 (下) 土台", center_x, bbox.min_y_m - half_foot_width, half_x, half_foot_width),
+            ("外壁 (左) 土台", bbox.min_x_m - half_foot_width, center_y, half_foot_width, half_y),
+            ("外壁 (右) 土台", bbox.max_x_m + half_foot_width, center_y, half_foot_width, half_y),
+        ]
+        for name, wx, wy, p1, p2 in visual_foots:
+            wall_objects.append({
+                "comment": name,
+                "type": "VISUAL_BOX",
+                "x": round(wx, 3),
+                "y": round(wy, 3),
+                "z_min": 0.0,
+                "z_max": 0.024,
+                "param1": round(p1, 3),
+                "param2": round(p2, 3),
+            })
+
+    # 2. LiDAR 照合用 立上りフェンス (BOX)
+    matching_uprights = [
+        ("外壁 (上) 立上り", center_x, bbox.max_y_m + half_thickness, half_x, half_thickness),
+        ("外壁 (下) 立上り", center_x, bbox.min_y_m - half_thickness, half_x, half_thickness),
+        ("外壁 (左) 立上り", bbox.min_x_m - half_thickness, center_y, half_thickness, half_y),
+        ("外壁 (右) 立上り", bbox.max_x_m + half_thickness, center_y, half_thickness, half_y),
+    ]
+    for name, wx, wy, p1, p2 in matching_uprights:
         wall_objects.append({
-            "comment": wall_name,
+            "comment": name,
             "type": "BOX",
             "x": round(wx, 3),
             "y": round(wy, 3),
@@ -49,19 +80,19 @@ def _generate_outer_walls(
             "param1": round(p1, 3),
             "param2": round(p2, 3),
         })
+
     return wall_objects
 
 
-def extract_field_objects_and_create_maps(
+def create_occupancy_grid_and_meta(
     cropped_points: np.ndarray,
     bbox: BoundingBox2D,
     floor_z_m: float,
     ground_margin_m: float,
     robot_height_m: float,
-    resolution_m: float,
-    generate_outer_walls: bool = True
-) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, CoordinateTransformMeta]:
-    """クロップ点群から 2D 占有格子マップを生成し、輪郭検出で障害物オブジェクトを抽出
+    resolution_m: float
+) -> Tuple[np.ndarray, CoordinateTransformMeta, np.ndarray]:
+    """クロップ点群から 2D 占有グリッドと座標メタデータを生成
 
     Args:
         cropped_points: クロップ済み点群 (N, 3)
@@ -70,14 +101,12 @@ def extract_field_objects_and_create_maps(
         ground_margin_m: 床面ノイズ除外マージン [m]
         robot_height_m: ロボット全高上限 [m]
         resolution_m: グリッド解像度 [m/pixel]
-        generate_outer_walls: 外周壁を自動生成するかどうか
 
     Returns:
-        Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, CoordinateTransformMeta]:
-            - field_objects: gn10-pointcloud-localization 互換オブジェクトリスト
-            - closed_obstacle_grid: モルフォロジー処理済み 2D 占有バイナリグリッド
-            - preview_bgr_image: 認識オブジェクト枠線を描画したプレビュー画像
-            - meta: クロップ領域の座標変換メタデータ
+        Tuple[np.ndarray, CoordinateTransformMeta, np.ndarray]:
+            - closed_obstacle_grid: モルフォロジー処理済み 2D 占有バイナリグリッド (Nav2用)
+            - meta: 座標変換メタデータ
+            - obstacle_points: 高さフィルタ通過点群
     """
     z_min_filter = floor_z_m + ground_margin_m
     z_max_filter = floor_z_m + robot_height_m
@@ -99,117 +128,123 @@ def extract_field_objects_and_create_maps(
     )
 
     binary_obstacle_grid = np.zeros((height_pixel, width_pixel), dtype=np.uint8)
-    cols = ((obstacle_points[:, 0] - bbox.min_x_m) / resolution_m).astype(int)
-    rows = ((bbox.max_y_m - obstacle_points[:, 1]) / resolution_m).astype(int)
-    valid = (cols >= 0) & (cols < width_pixel) & (rows >= 0) & (rows < height_pixel)
-    binary_obstacle_grid[rows[valid], cols[valid]] = 255
+    if len(obstacle_points) > 0:
+        cols = ((obstacle_points[:, 0] - bbox.min_x_m) / resolution_m).astype(int)
+        rows = ((bbox.max_y_m - obstacle_points[:, 1]) / resolution_m).astype(int)
+        valid = (cols >= 0) & (cols < width_pixel) & (rows >= 0) & (rows < height_pixel)
+        binary_obstacle_grid[rows[valid], cols[valid]] = 255
 
-    # モルフォロジー演算 (Closing) で微小点群ノイズを繋ぎ、物体化
+    # モルフォロジー演算 (Closing) で微小点群ノイズを繋ぎ、Nav2 用占有マップを生成
     kernel_size_pixel = max(3, int(0.10 / resolution_m))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size_pixel, kernel_size_pixel))
     closed_obstacle_grid = cv2.morphologyEx(binary_obstacle_grid, cv2.MORPH_CLOSE, kernel)
 
+    return closed_obstacle_grid, meta, obstacle_points
+
+
+def draw_objects_on_preview(
+    preview_bgr_image: np.ndarray,
+    meta: CoordinateTransformMeta,
+    field_objects: List[Dict[str, Any]]
+) -> np.ndarray:
+    """プレビュー画像上に登録オブジェクトの枠線とラベルを描画
+
+    Args:
+        preview_bgr_image: 描画対象画像 (BGR)
+        meta: 座標変換メタデータ
+        field_objects: オブジェクト定義リスト
+
+    Returns:
+        np.ndarray: 描画済み画像
+    """
+    output_image = preview_bgr_image.copy()
+
+    for idx, obj in enumerate(field_objects, 1):
+        obj_type = obj.get("type", "BOX")
+        cx, cy = obj["x"], obj["y"]
+        col_c, row_c = meta.world_to_pixel(cx, cy)
+
+        label_type = "Cyl" if obj_type == "CYLINDER" else "Box"
+        if "外壁" in obj.get("comment", ""):
+            label_type = "Wall"
+
+        if obj_type == "CYLINDER":
+            radius_pixel = int(obj["param1"] / meta.resolution_m)
+            cv2.circle(output_image, (col_c, row_c), radius_pixel, (0, 0, 255), 2)
+            cv2.putText(
+                output_image, f"[{idx}] {label_type}",
+                (col_c + 5, row_c), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1
+            )
+        elif obj_type == "BOX":
+            half_w_pixel = int(obj["param1"] / meta.resolution_m)
+            half_h_pixel = int(obj["param2"] / meta.resolution_m)
+            p1 = (col_c - half_w_pixel, row_c - half_h_pixel)
+            p2 = (col_c + half_w_pixel, row_c + half_h_pixel)
+            cv2.rectangle(output_image, p1, p2, (0, 255, 0), 2)
+            cv2.putText(
+                output_image, f"[{idx}] {label_type}",
+                (p1[0] + 3, max(15, p1[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1
+            )
+        elif obj_type == "VISUAL_BOX":
+            half_w_pixel = int(obj["param1"] / meta.resolution_m)
+            half_h_pixel = int(obj["param2"] / meta.resolution_m)
+            p1 = (col_c - half_w_pixel, row_c - half_h_pixel)
+            p2 = (col_c + half_w_pixel, row_c + half_h_pixel)
+            cv2.rectangle(output_image, p1, p2, (80, 80, 80), 1)
+
+    return output_image
+
+
+def build_field_map_data(
+    cropped_points: np.ndarray,
+    bbox: BoundingBox2D,
+    floor_z_m: float,
+    ground_margin_m: float,
+    robot_height_m: float,
+    resolution_m: float,
+    generate_outer_walls_flag: bool = True,
+    additional_objects: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, CoordinateTransformMeta]:
+    """クロップ点群から 2D 地図と gn10 互換フィールド定義を構築
+
+    Args:
+        cropped_points: クロップ済み点群 (N, 3)
+        bbox: 選択バウンディングボックス
+        floor_z_m: 床面 Z 座標 [m]
+        ground_margin_m: 床面ノイズ除外マージン [m]
+        robot_height_m: ロボット全高上限 [m]
+        resolution_m: グリッド解像度 [m/pixel]
+        generate_outer_walls_flag: 外壁を生成するか
+        additional_objects: 手動追加されたオブジェクト定義のリスト
+
+    Returns:
+        Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, CoordinateTransformMeta]:
+            - field_objects: gn10-pointcloud-localization 互換オブジェクトリスト
+            - closed_obstacle_grid: Nav2 用 2D 占有バイナリグリッド
+            - preview_bgr_image: 描画済みプレビュー画像
+            - meta: クロップ領域の座標変換メタデータ
+    """
+    closed_obstacle_grid, meta, _ = create_occupancy_grid_and_meta(
+        cropped_points=cropped_points,
+        bbox=bbox,
+        floor_z_m=floor_z_m,
+        ground_margin_m=ground_margin_m,
+        robot_height_m=robot_height_m,
+        resolution_m=resolution_m
+    )
+
     field_objects: List[Dict[str, Any]] = []
-    preview_bgr_image = cv2.cvtColor(closed_obstacle_grid, cv2.COLOR_GRAY2BGR)
 
-    # 1. 外周壁 (選択範囲の外枠) を自動生成
-    if generate_outer_walls:
-        field_objects.extend(_generate_outer_walls(bbox))
+    # 1. 外周壁 (立上りフェンス & 土台)
+    if generate_outer_walls_flag:
+        field_objects.extend(generate_outer_walls(bbox))
 
-    # 2. 内部の障害物（机、バケツなど）を輪郭検出
-    inner_mask = np.copy(closed_obstacle_grid)
-    # 外枠 2 ピクセルをゼロクリア（外枠境界の巻き込みを防止）
-    inner_mask[0:2, :] = 0
-    inner_mask[-2:, :] = 0
-    inner_mask[:, 0:2] = 0
-    inner_mask[:, -2:] = 0
+    # 2. 手動追加オブジェクト
+    if additional_objects:
+        field_objects.extend(additional_objects)
 
-    contours, _ = cv2.findContours(inner_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    min_area_pixel = (0.15 / resolution_m) * (0.15 / resolution_m)  # 15cm x 15cm 未満のノイズは無視
-    object_index = 1
-
-    for contour in contours:
-        contour_area = cv2.contourArea(contour)
-        if contour_area < min_area_pixel:
-            continue
-
-        perimeter = cv2.arcLength(contour, closed=True)
-        circularity = 4.0 * np.pi * contour_area / (perimeter * perimeter) if perimeter > 0 else 0.0
-
-        # マスクを作成して、この輪郭内の点の Z 範囲を取得
-        contour_mask = np.zeros((height_pixel, width_pixel), dtype=np.uint8)
-        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
-        point_in_contour = contour_mask[rows[valid], cols[valid]] == 255
-        matched_z = obstacle_points[valid][point_in_contour, 2]
-
-        if len(matched_z) > 0:
-            obj_z_min = float(np.percentile(matched_z, 5) - floor_z_m)
-            obj_z_max = float(np.percentile(matched_z, 95) - floor_z_m)
-        else:
-            obj_z_min = 0.024
-            obj_z_max = 0.76
-
-        obj_z_min = max(0.0, obj_z_min)
-        obj_z_max = max(obj_z_min + 0.05, obj_z_max)
-
-        # 形状判定 (円形度 >= 0.82 は円柱、それ以外は直方体)
-        if circularity >= 0.82:
-            # 円柱 (CYLINDER)
-            (circle_col, circle_row), circle_radius_pixel = cv2.minEnclosingCircle(contour)
-            center_x_m, center_y_m = meta.pixel_to_world(int(circle_col), int(circle_row))
-            radius_m = circle_radius_pixel * resolution_m
-
-            comment_str = f"円柱/バケツ {object_index} (半径:{radius_m:.2f}m)"
-            field_object = {
-                "comment": comment_str,
-                "type": "CYLINDER",
-                "x": round(center_x_m, 3),
-                "y": round(center_y_m, 3),
-                "z_min": round(obj_z_min, 3),
-                "z_max": round(obj_z_max, 3),
-                "param1": round(radius_m, 4),
-                "param2": 0.0
-            }
-            cv2.circle(preview_bgr_image, (int(circle_col), int(circle_row)), int(circle_radius_pixel), (0, 0, 255), 2)
-            cv2.putText(preview_bgr_image, f"[{object_index}] Cyl", (int(circle_col) + 5, int(circle_row)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-
-        else:
-            # 直方体 (BOX)
-            rot_rect = cv2.minAreaRect(contour)
-            (rect_col, rect_row), (rect_w_pixel, rect_h_pixel), rect_angle_deg = rot_rect
-            center_x_m, center_y_m = meta.pixel_to_world(int(rect_col), int(rect_row))
-
-            half_width_m = (rect_w_pixel * resolution_m) / 2.0
-            half_height_m = (rect_h_pixel * resolution_m) / 2.0
-
-            aspect_ratio = max(half_width_m, half_height_m) / max(0.01, min(half_width_m, half_height_m))
-
-            if aspect_ratio >= 4.0:
-                comment_str = f"仕切り板/構造物 {object_index}"
-                draw_color = (255, 120, 0)
-            else:
-                comment_str = f"机/台座 {object_index}"
-                draw_color = (0, 255, 0)
-
-            field_object = {
-                "comment": comment_str,
-                "type": "BOX",
-                "x": round(center_x_m, 3),
-                "y": round(center_y_m, 3),
-                "z_min": round(obj_z_min, 3),
-                "z_max": round(obj_z_max, 3),
-                "param1": round(half_width_m, 3),
-                "param2": round(half_height_m, 3)
-            }
-            box_points = cv2.boxPoints(rot_rect)
-            box_points = np.int32(box_points)
-            cv2.drawContours(preview_bgr_image, [box_points], 0, draw_color, 2)
-            cv2.putText(preview_bgr_image, f"[{object_index}] Box", (int(rect_col) + 5, int(rect_row)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_color, 1)
-
-        field_objects.append(field_object)
-        object_index += 1
+    # プレビュー画像生成 & オブジェクト描画
+    preview_base = cv2.cvtColor(closed_obstacle_grid, cv2.COLOR_GRAY2BGR)
+    preview_bgr_image = draw_objects_on_preview(preview_base, meta, field_objects)
 
     return field_objects, closed_obstacle_grid, preview_bgr_image, meta

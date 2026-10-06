@@ -1,8 +1,8 @@
 """
-点群の鳥瞰図プレビュー生成および切り抜き領域 (ROI) 選択モジュール
+点群の鳥瞰図プレビュー生成、領域選択 (ROI)、および手動障害物追加モジュール
 """
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -116,13 +116,13 @@ def select_region_of_interest(
         return BoundingBox2D(min_x_m=min_x_m, max_x_m=max_x_m, min_y_m=min_y_m, max_y_m=max_y_m)
 
     print("\n=======================================================")
-    print("【操作方法】")
+    print("【操作方法: フィールド領域選択】")
     print(" 1. ポップアップしたウィンドウで、使いたい部屋・フィールドをマウスドラッグで囲んでください。")
     print(" 2. 囲んだら [Space] または [Enter] キーを押して確定します。")
     print(" 3. やり直したい場合は [c] キーを押してください。")
     print("=======================================================\n")
 
-    window_name = "PCD Map Generator - Drag to Select Field Area (Enter/Space: Confirm, c: Retry)"
+    window_name = "PCD Map Generator - Select Field Area (Enter/Space: Confirm, c: Retry)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, min(1200, preview_image.shape[1]), min(900, preview_image.shape[0]))
 
@@ -144,3 +144,135 @@ def select_region_of_interest(
 
     print(f"[3/6] 選択完了: X=[{min_x_m:.2f}, {max_x_m:.2f}] m, Y=[{min_y_m:.2f}, {max_y_m:.2f}] m")
     return BoundingBox2D(min_x_m=min_x_m, max_x_m=max_x_m, min_y_m=min_y_m, max_y_m=max_y_m)
+
+
+def select_obstacles_interactively(
+    cropped_points: np.ndarray,
+    local_meta: CoordinateTransformMeta,
+    floor_z_m: float,
+    base_preview_image: np.ndarray
+) -> List[Dict[str, Any]]:
+    """GUI マウス操作で障害物 (机・バケツなど) を対話的に手動選択して追加
+
+    Args:
+        cropped_points: 切り抜きエリア内の点群 (N, 3)
+        local_meta: 切り抜きエリアの座標変換メタデータ
+        floor_z_m: 床面の Z 座標 [m]
+        base_preview_image: 切り抜きエリアのプレビュー画像 (BGR)
+
+    Returns:
+        List[Dict[str, Any]]: 追加されたオブジェクト定義辞書のリスト
+    """
+    print("\n=======================================================")
+    print("【操作方法: 障害物の手動追加 (GUI)】")
+    print(" 追加したい机やバケツをマウスドラッグで囲んで [Enter] で確定します。")
+    print(" 何も囲まずに [Enter] または [ESC] を押すと、追加を終了します。")
+    print("=======================================================\n")
+
+    current_preview = base_preview_image.copy()
+    added_objects: List[Dict[str, Any]] = []
+    object_count = 1
+
+    window_name = "Add Obstacles (Drag box -> Enter to confirm / Empty Enter to finish)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, min(1200, current_preview.shape[1]), min(900, current_preview.shape[0]))
+
+    while True:
+        col, row, width, height = cv2.selectROI(
+            window_name, current_preview, fromCenter=False, showCrosshair=True
+        )
+
+        # 何も囲まれずに確定されたら終了
+        if width == 0 or height == 0:
+            break
+
+        # 選択された矩形の実世界座標
+        x1_m, y1_m = local_meta.pixel_to_world(col, row)
+        x2_m, y2_m = local_meta.pixel_to_world(col + width, row + height)
+        sel_min_x, sel_max_x = min(x1_m, x2_m), max(x1_m, x2_m)
+        sel_min_y, sel_max_y = min(y1_m, y2_m), max(y1_m, y2_m)
+
+        center_x = (sel_min_x + sel_max_x) / 2.0
+        center_y = (sel_min_y + sel_max_y) / 2.0
+        half_w = (sel_max_x - sel_min_x) / 2.0
+        half_h = (sel_max_y - sel_min_y) / 2.0
+
+        # 囲まれた範囲内の点群から高さを自動推定
+        in_x = (cropped_points[:, 0] >= sel_min_x) & (cropped_points[:, 0] <= sel_max_x)
+        in_y = (cropped_points[:, 1] >= sel_min_y) & (cropped_points[:, 1] <= sel_max_y)
+        points_in_roi = cropped_points[in_x & in_y]
+
+        if len(points_in_roi) > 0:
+            est_z_min = float(np.percentile(points_in_roi[:, 2], 5) - floor_z_m)
+            est_z_max = float(np.percentile(points_in_roi[:, 2], 95) - floor_z_m)
+        else:
+            est_z_min, est_z_max = 0.0, 0.76
+
+        est_z_min = max(0.0, round(est_z_min, 3))
+        est_z_max = max(est_z_min + 0.05, round(est_z_max, 3))
+
+        # コンソールで形状タイプと高さを確認・入力
+        print(f"\n--- 障害物 #{object_count} を選択 ---")
+        print(f" 位置: X={center_x:.2f}m, Y={center_y:.2f}m")
+        print(f" 寸法: 幅={half_w*2:.2f}m, 奥行き={half_h*2:.2f}m")
+        print(f" 点群から推定された高さ: Z_min={est_z_min:.2f}m, Z_max={est_z_max:.2f}m")
+
+        type_input = input(" 形状を選択 [1: 直方体 (BOX), 2: 円柱 (CYLINDER)] (デフォルト: 1): ").strip()
+        obj_type = "CYLINDER" if type_input == "2" else "BOX"
+
+        comment_default = f"手動追加_{'バケツ' if obj_type == 'CYLINDER' else '机'}_{object_count}"
+        comment_input = input(f" コメント名 (デフォルト: {comment_default}): ").strip()
+        comment = comment_input if comment_input else comment_default
+
+        z_input = input(f" 高さ設定 [z_min, z_max] (Enterで推定値 [{est_z_min}, {est_z_max}] を採用): ").strip()
+        if z_input:
+            try:
+                parts = [float(p) for p in z_input.replace(",", " ").split()]
+                if len(parts) >= 2:
+                    est_z_min, est_z_max = parts[0], parts[1]
+            except ValueError:
+                pass
+
+        if obj_type == "CYLINDER":
+            radius = (half_w + half_h) / 2.0
+            obj_def = {
+                "comment": comment,
+                "type": "CYLINDER",
+                "x": round(center_x, 3),
+                "y": round(center_y, 3),
+                "z_min": round(est_z_min, 3),
+                "z_max": round(est_z_max, 3),
+                "param1": round(radius, 4),
+                "param2": 0.0
+            }
+            # プレビュー上に円を描画
+            col_c, row_c = local_meta.world_to_pixel(center_x, center_y)
+            rad_px = int(radius / local_meta.resolution_m)
+            cv2.circle(current_preview, (col_c, row_c), rad_px, (0, 0, 255), 2)
+            cv2.putText(current_preview, comment, (col_c + 5, row_c),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+        else:
+            obj_def = {
+                "comment": comment,
+                "type": "BOX",
+                "x": round(center_x, 3),
+                "y": round(center_y, 3),
+                "z_min": round(est_z_min, 3),
+                "z_max": round(est_z_max, 3),
+                "param1": round(half_w, 3),
+                "param2": round(half_h, 3)
+            }
+            # プレビュー上に矩形を描画
+            p1_px = (col, row)
+            p2_px = (col + width, row + height)
+            cv2.rectangle(current_preview, p1_px, p2_px, (0, 255, 0), 2)
+            cv2.putText(current_preview, comment, (col + 3, row - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
+        added_objects.append(obj_def)
+        print(f" -> 障害物 #{object_count} を登録しました！\n")
+        object_count += 1
+
+    cv2.destroyAllWindows()
+    print(f"手動障害物の登録を完了しました (合計 {len(added_objects)} 個追加)。")
+    return added_objects
