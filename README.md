@@ -76,3 +76,21 @@ python3 pcd_map_generator.py /path/to/your_map.pcd \
 2. **`{prefix}_map.json`**: 外壁・机・円柱が定義された JSON (`map_source_type: "json"` で使用可能)
 3. **`{prefix}_map.pgm` / `.yaml`**: ROS 2 Nav2 標準の 2D Occupancy Grid 地図
 4. **`{prefix}_preview.png`**: 検出されたオブジェクト枠（番号・名前付き）の確認用画像
+
+---
+
+## ディレクトリ構成
+
+```text
+pcd-map-generator/
+├── pcd_map_generator/        # コアモジュールパッケージ
+│   ├── __init__.py           # パッケージエクスポート
+│   ├── coordinates.py        # 座標系・相互変換 (CoordinateTransformMeta, BoundingBox2D)
+│   ├── pointcloud.py         # 点群I/O・床面Z推定・クロップ処理
+│   ├── selector.py           # 鳥瞰図プレビュー生成・ROI領域選択
+│   ├── extractor.py          # 幾何オブジェクト抽出 (外壁・机・バケツの認識)
+│   └── exporter.py           # Nav2 PGM/YAML, JSON, プレビューPNG の出力
+├── pcd_map_generator.py      # CLI エントリポイント
+├── requirements.txt          # 依存パッケージ定義
+└── README.md
+```
