@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+test_output/
+output/
+*.pcd
+*.pgm
+*.png
