@@ -70,6 +70,11 @@ def parse_arguments() -> argparse.Namespace:
         help="外周壁の自動生成を無効化する場合"
     )
     parser.add_argument(
+        "--keep_raw_points",
+        action="store_true",
+        help="Nav2 マップで点群の生ノイズや凹凸をそのまま残す場合 (デフォルトはクリーン化)"
+    )
+    parser.add_argument(
         "--add_obstacles",
         action="store_true",
         help="GUI で机やバケツなどの障害物を手動追加するモード"
@@ -149,16 +154,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
             prompt_add = user_choice in ["y", "yes"]
 
         if prompt_add:
-            base_preview_bgr = cv2.cvtColor(closed_obstacle_grid, cv2.COLOR_GRAY2BGR)
             additional_objects = select_obstacles_interactively(
                 cropped_points=cropped_points,
                 local_meta=local_meta,
                 floor_z_m=floor_z_m,
-                base_preview_image=base_preview_bgr
+                ground_margin_m=args.ground_margin_m,
+                robot_height_m=args.robot_height_m
             )
 
     # 8. フィールド定義オブジェクト (外壁 + 追加障害物) およびプレビュー生成
-    field_objects, _, preview_image, _ = build_field_map_data(
+    field_objects, nav2_obstacle_grid, preview_image, _ = build_field_map_data(
         cropped_points=cropped_points,
         bbox=selected_bbox,
         floor_z_m=floor_z_m,
@@ -166,13 +171,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
         robot_height_m=args.robot_height_m,
         resolution_m=args.resolution_m,
         generate_outer_walls_flag=(not args.no_outer_walls),
-        additional_objects=additional_objects
+        additional_objects=additional_objects,
+        clean_map_mode=(not args.keep_raw_points)
     )
 
     # 9. ROS 2 Nav2 標準マップ (PGM + YAML) 保存
     output_pgm_path = os.path.join(args.output_dir, f"{args.prefix}_map.pgm")
     output_yaml_path = os.path.join(args.output_dir, f"{args.prefix}_map.yaml")
-    save_ros_nav2_map(closed_obstacle_grid, local_meta, output_pgm_path, output_yaml_path)
+    save_ros_nav2_map(nav2_obstacle_grid, local_meta, output_pgm_path, output_yaml_path)
 
     # 10. 人間確認用プレビュー画像 (PNG) 保存
     output_preview_png = os.path.join(args.output_dir, f"{args.prefix}_preview.png")

@@ -20,7 +20,7 @@ def generate_outer_walls(
 
     高専ロボコン/NHK学生ロボコンの CAD 規格（150mm L字断面・木材厚24mm）に準拠:
     - 立上り部 (BOX): LiDAR 点群と照合される 24mm 厚の木材 (Z: 0.024m 〜 0.150m)
-    - 土台部 (VISUAL_BOX): 床面に置かれる 150mm 幅の土台 (Z: 0.000m 〜 0.024m, 地面除去で消えるため照合外)
+    - 土台部 (VISUAL_BOX): 床面に置かれる 150mm 幅の土台 (Z: 0.000m 〜 0.024m)
 
     Args:
         bbox: 選択バウンディングボックス (競技エリアの内寸境界)
@@ -92,7 +92,7 @@ def create_occupancy_grid_and_meta(
     robot_height_m: float,
     resolution_m: float
 ) -> Tuple[np.ndarray, CoordinateTransformMeta, np.ndarray]:
-    """クロップ点群から 2D 占有グリッドと座標メタデータを生成
+    """クロップ点群から 2D 点群プレビュー用グリッドと座標メタデータを生成
 
     Args:
         cropped_points: クロップ済み点群 (N, 3)
@@ -104,7 +104,7 @@ def create_occupancy_grid_and_meta(
 
     Returns:
         Tuple[np.ndarray, CoordinateTransformMeta, np.ndarray]:
-            - closed_obstacle_grid: モルフォロジー処理済み 2D 占有バイナリグリッド (Nav2用)
+            - closed_obstacle_grid: 点群可視化用の 2D バイナリグリッド
             - meta: 座標変換メタデータ
             - obstacle_points: 高さフィルタ通過点群
     """
@@ -134,7 +134,6 @@ def create_occupancy_grid_and_meta(
         valid = (cols >= 0) & (cols < width_pixel) & (rows >= 0) & (rows < height_pixel)
         binary_obstacle_grid[rows[valid], cols[valid]] = 255
 
-    # モルフォロジー演算 (Closing) で微小点群ノイズを繋ぎ、Nav2 用占有マップを生成
     kernel_size_pixel = max(3, int(0.10 / resolution_m))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size_pixel, kernel_size_pixel))
     closed_obstacle_grid = cv2.morphologyEx(binary_obstacle_grid, cv2.MORPH_CLOSE, kernel)
@@ -142,21 +141,63 @@ def create_occupancy_grid_and_meta(
     return closed_obstacle_grid, meta, obstacle_points
 
 
+def create_clean_nav2_map(
+    meta: CoordinateTransformMeta,
+    field_objects: List[Dict[str, Any]],
+    wall_thickness_m: float = 0.05
+) -> np.ndarray:
+    """内部を完全な白（フリースペース）にし、外壁と登録障害物のみを正確に描画した Nav2 用グリッドを生成
+
+    Args:
+        meta: 座標変換メタデータ
+        field_objects: 登録オブジェクト (外壁 + 手動追加障害物)
+        wall_thickness_m: 外壁フェンスの描画厚み [m]
+
+    Returns:
+        np.ndarray: クリーンな Nav2 用バイナリグリッド (255: 障害物, 0: フリースペース)
+    """
+    # 内部はすべて 0 (フリースペース = 白床)
+    clean_grid = np.zeros((meta.image_height_pixel, meta.image_width_pixel), dtype=np.uint8)
+
+    # 1. 外枠四辺に真っ直ぐな外壁 (255 = 障害物) を描画
+    thickness_px = max(1, int(wall_thickness_m / meta.resolution_m))
+    cv2.rectangle(
+        clean_grid,
+        (0, 0),
+        (meta.image_width_pixel - 1, meta.image_height_pixel - 1),
+        255,
+        thickness=thickness_px
+    )
+
+    # 2. 手動追加された障害物 (机・バケツなど) を正確な幾何形状で描画
+    for obj in field_objects:
+        obj_type = obj.get("type", "BOX")
+        # 外壁は既に四辺に描画済みなのでスキップ
+        if "外壁" in obj.get("comment", "") or obj_type == "VISUAL_BOX":
+            continue
+
+        cx, cy = obj["x"], obj["y"]
+        col_c, row_c = meta.world_to_pixel(cx, cy)
+
+        if obj_type == "CYLINDER":
+            radius_px = max(1, int(obj["param1"] / meta.resolution_m))
+            cv2.circle(clean_grid, (col_c, row_c), radius_px, 255, -1)  # 塗りつぶし
+        elif obj_type == "BOX":
+            hw_px = max(1, int(obj["param1"] / meta.resolution_m))
+            hd_px = max(1, int(obj["param2"] / meta.resolution_m))
+            p1 = (max(0, col_c - hw_px), max(0, row_c - hd_px))
+            p2 = (min(meta.image_width_pixel - 1, col_c + hw_px), min(meta.image_height_pixel - 1, row_c + hd_px))
+            cv2.rectangle(clean_grid, p1, p2, 255, -1)  # 塗りつぶし
+
+    return clean_grid
+
+
 def draw_objects_on_preview(
     preview_bgr_image: np.ndarray,
     meta: CoordinateTransformMeta,
     field_objects: List[Dict[str, Any]]
 ) -> np.ndarray:
-    """プレビュー画像上に登録オブジェクトの枠線とラベルを描画
-
-    Args:
-        preview_bgr_image: 描画対象画像 (BGR)
-        meta: 座標変換メタデータ
-        field_objects: オブジェクト定義リスト
-
-    Returns:
-        np.ndarray: 描画済み画像
-    """
+    """プレビュー画像上に登録オブジェクトの枠線とラベルを描画"""
     output_image = preview_bgr_image.copy()
 
     for idx, obj in enumerate(field_objects, 1):
@@ -203,9 +244,10 @@ def build_field_map_data(
     robot_height_m: float,
     resolution_m: float,
     generate_outer_walls_flag: bool = True,
-    additional_objects: Optional[List[Dict[str, Any]]] = None
+    additional_objects: Optional[List[Dict[str, Any]]] = None,
+    clean_map_mode: bool = True
 ) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, CoordinateTransformMeta]:
-    """クロップ点群から 2D 地図と gn10 互換フィールド定義を構築
+    """クロップ点群からクリーンな Nav2 2D 地図と gn10 互換フィールド定義を構築
 
     Args:
         cropped_points: クロップ済み点群 (N, 3)
@@ -216,15 +258,16 @@ def build_field_map_data(
         resolution_m: グリッド解像度 [m/pixel]
         generate_outer_walls_flag: 外壁を生成するか
         additional_objects: 手動追加されたオブジェクト定義のリスト
+        clean_map_mode: 内部ノイズを一掃し、直線壁と登録障害物のみを描画するモード
 
     Returns:
         Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, CoordinateTransformMeta]:
             - field_objects: gn10-pointcloud-localization 互換オブジェクトリスト
-            - closed_obstacle_grid: Nav2 用 2D 占有バイナリグリッド
+            - nav2_obstacle_grid: Nav2 用 2D 占有バイナリグリッド (255: 障害物, 0: 床)
             - preview_bgr_image: 描画済みプレビュー画像
             - meta: クロップ領域の座標変換メタデータ
     """
-    closed_obstacle_grid, meta, _ = create_occupancy_grid_and_meta(
+    raw_obstacle_grid, meta, _ = create_occupancy_grid_and_meta(
         cropped_points=cropped_points,
         bbox=bbox,
         floor_z_m=floor_z_m,
@@ -243,8 +286,15 @@ def build_field_map_data(
     if additional_objects:
         field_objects.extend(additional_objects)
 
-    # プレビュー画像生成 & オブジェクト描画
-    preview_base = cv2.cvtColor(closed_obstacle_grid, cv2.COLOR_GRAY2BGR)
+    # 3. Nav2 用グリッドの作成
+    if clean_map_mode:
+        # ユーザー提案のクリーンモード: 内部を完全な白床にし、直線壁と登録障害物のみ描画
+        nav2_obstacle_grid = create_clean_nav2_map(meta, field_objects)
+    else:
+        nav2_obstacle_grid = raw_obstacle_grid
+
+    # プレビュー画像生成 & オブジェクト枠描画
+    preview_base = cv2.cvtColor(raw_obstacle_grid, cv2.COLOR_GRAY2BGR)
     preview_bgr_image = draw_objects_on_preview(preview_base, meta, field_objects)
 
-    return field_objects, closed_obstacle_grid, preview_bgr_image, meta
+    return field_objects, nav2_obstacle_grid, preview_bgr_image, meta

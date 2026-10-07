@@ -124,7 +124,13 @@ def select_region_of_interest(
 
     window_name = "PCD Map Generator - Select Field Area (Enter/Space: Confirm, c: Retry)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, min(1200, preview_image.shape[1]), min(900, preview_image.shape[0]))
+    
+    # 画像のアスペクト比を維持しつつ、画面上で見やすい大きさに拡大 (幅1000〜1400px、高さ800〜950px程度)
+    img_h, img_w = preview_image.shape[:2]
+    scale = max(1.0, min(1300.0 / max(1, img_w), 900.0 / max(1, img_h)))
+    display_w = int(img_w * scale)
+    display_h = int(img_h * scale)
+    cv2.resizeWindow(window_name, display_w, display_h)
 
     col_pixel, row_pixel, width_pixel, height_pixel = cv2.selectROI(
         window_name, preview_image, fromCenter=False, showCrosshair=True
@@ -146,11 +152,53 @@ def select_region_of_interest(
     return BoundingBox2D(min_x_m=min_x_m, max_x_m=max_x_m, min_y_m=min_y_m, max_y_m=max_y_m)
 
 
+def create_obstacle_selection_guide_image(
+    cropped_points: np.ndarray,
+    local_meta: CoordinateTransformMeta,
+    floor_z_m: float,
+    ground_margin_m: float = 0.03,
+    robot_height_m: float = 1.5
+) -> np.ndarray:
+    """障害物選択用の直感的でクリーンな下書き画像を生成
+
+    - 背景: 白 (走行可能床)
+    - 外壁: ピシッとした緑の枠線
+    - 点群: 位置の目印となる薄いグレースケールドット (ノイズに見えないよう淡く表示)
+    """
+    guide_image = np.full((local_meta.image_height_pixel, local_meta.image_width_pixel, 3), 255, dtype=np.uint8)
+
+    # 1. 障害物高さの点群を薄いドットとして描画
+    z_min_filter = floor_z_m + ground_margin_m
+    z_max_filter = floor_z_m + robot_height_m
+    mask = (cropped_points[:, 2] >= z_min_filter) & (cropped_points[:, 2] <= z_max_filter)
+    pts = cropped_points[mask]
+
+    if len(pts) > 0:
+        cols = ((pts[:, 0] - local_meta.min_x_m) / local_meta.resolution_m).astype(int)
+        rows = ((local_meta.max_y_m - pts[:, 1]) / local_meta.resolution_m).astype(int)
+        valid = (cols >= 0) & (cols < local_meta.image_width_pixel) & (rows >= 0) & (rows < local_meta.image_height_pixel)
+        # 淡いグレー (190, 190, 190) で目印として描画
+        guide_image[rows[valid], cols[valid]] = (190, 190, 190)
+
+    # 2. 外壁フェンスの四辺を鮮やかな緑で描画
+    thickness_px = max(1, int(0.024 / local_meta.resolution_m))
+    cv2.rectangle(
+        guide_image,
+        (0, 0),
+        (local_meta.image_width_pixel - 1, local_meta.image_height_pixel - 1),
+        (0, 180, 0),
+        thickness_px
+    )
+
+    return guide_image
+
+
 def select_obstacles_interactively(
     cropped_points: np.ndarray,
     local_meta: CoordinateTransformMeta,
     floor_z_m: float,
-    base_preview_image: np.ndarray
+    ground_margin_m: float = 0.03,
+    robot_height_m: float = 1.5
 ) -> List[Dict[str, Any]]:
     """GUI マウス操作で障害物 (机・バケツなど) を対話的に手動選択して追加
 
@@ -158,24 +206,35 @@ def select_obstacles_interactively(
         cropped_points: 切り抜きエリア内の点群 (N, 3)
         local_meta: 切り抜きエリアの座標変換メタデータ
         floor_z_m: 床面の Z 座標 [m]
-        base_preview_image: 切り抜きエリアのプレビュー画像 (BGR)
+        ground_margin_m: 床面マージン [m]
+        robot_height_m: ロボット全高 [m]
 
     Returns:
         List[Dict[str, Any]]: 追加されたオブジェクト定義辞書のリスト
     """
     print("\n=======================================================")
     print("【操作方法: 障害物の手動追加 (GUI)】")
-    print(" 追加したい机やバケツをマウスドラッグで囲んで [Enter] で確定します。")
-    print(" 何も囲まずに [Enter] または [ESC] を押すと、追加を終了します。")
+    print(" 薄いグレーの点群を参考に、追加したい机やバケツをマウスドラッグで囲んで [Enter] を押してください。")
+    print(" 追加する障害物がない（または終わった）場合は、何も囲まずに [Enter] または [ESC] を押すと完了します。")
     print("=======================================================\n")
 
-    current_preview = base_preview_image.copy()
+    current_preview = create_obstacle_selection_guide_image(
+        cropped_points=cropped_points,
+        local_meta=local_meta,
+        floor_z_m=floor_z_m,
+        ground_margin_m=ground_margin_m,
+        robot_height_m=robot_height_m
+    )
     added_objects: List[Dict[str, Any]] = []
     object_count = 1
 
     window_name = "Add Obstacles (Drag box -> Enter to confirm / Empty Enter to finish)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, min(1200, current_preview.shape[1]), min(900, current_preview.shape[0]))
+    # 選択しやすいように画面上で見やすい大きさに拡大 (幅・高さ約800〜1000px)
+    scale = max(1.0, min(1000.0 / max(1, current_preview.shape[1]), 850.0 / max(1, current_preview.shape[0])))
+    win_w = int(current_preview.shape[1] * scale)
+    win_h = int(current_preview.shape[0] * scale)
+    cv2.resizeWindow(window_name, win_w, win_h)
 
     while True:
         col, row, width, height = cv2.selectROI(
@@ -245,11 +304,11 @@ def select_obstacles_interactively(
                 "param1": round(radius, 4),
                 "param2": 0.0
             }
-            # プレビュー上に円を描画
+            # プレビュー上に円を描画 (赤色)
             col_c, row_c = local_meta.world_to_pixel(center_x, center_y)
             rad_px = int(radius / local_meta.resolution_m)
             cv2.circle(current_preview, (col_c, row_c), rad_px, (0, 0, 255), 2)
-            cv2.putText(current_preview, comment, (col_c + 5, row_c),
+            cv2.putText(current_preview, f"[{object_count}] Cyl", (col_c + 5, row_c),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
         else:
             obj_def = {
@@ -262,12 +321,12 @@ def select_obstacles_interactively(
                 "param1": round(half_w, 3),
                 "param2": round(half_h, 3)
             }
-            # プレビュー上に矩形を描画
+            # プレビュー上に矩形を描画 (青色)
             p1_px = (col, row)
             p2_px = (col + width, row + height)
-            cv2.rectangle(current_preview, p1_px, p2_px, (0, 255, 0), 2)
-            cv2.putText(current_preview, comment, (col + 3, row - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            cv2.rectangle(current_preview, p1_px, p2_px, (255, 0, 0), 2)
+            cv2.putText(current_preview, f"[{object_count}] Box", (col + 3, row - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
 
         added_objects.append(obj_def)
         print(f" -> 障害物 #{object_count} を登録しました！\n")
